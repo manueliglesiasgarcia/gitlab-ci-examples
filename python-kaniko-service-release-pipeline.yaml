@@ -1,0 +1,188 @@
+---
+stages:
+  - security_compliance
+  - Release_QA
+  - Release_PreProduction
+  - Release_Production
+
+docker_best_practices:
+  stage: security_compliance
+  allow_failure: false
+  image: docker:stable
+  services:
+    - name: docker:dind
+      entrypoint: ["env", "-u", "DOCKER_HOST"]
+      command: ["dockerd-entrypoint.sh"]
+  variables:
+    DOCKER_HOST: tcp://docker:2375/
+    DOCKER_DRIVER: overlay2
+    # See https://github.com/docker-library/docker/pull/166
+    DOCKER_TLS_CERTDIR: ""
+    IMAGE: docker-best-practices-ci-test:$CI_COMMIT_SHA
+  script:
+    - if grep -Eqm1 'alpine|node|corretto' Dockerfile; then echo "Uses the allowed distributions" ; else echo "Doesn't use the allowed distributions" && exit 1; fi
+    - if grep -qm1 'latest' Dockerfile; then echo "Shouldn't use latest tag" && exit 1 ; else echo "Doesn't use latest tag"; fi
+    # Build image
+    - docker build -t $IMAGE .
+    - if [[ $(docker inspect $IMAGE -f "{{ .ContainerConfig.User }}") ]];  then echo "User isn't root"  ; else echo "User is root" && exit 1; fi
+    - if [[ $(docker inspect $IMAGE -f "{{ .ContainerConfig.User }}") == "root" ]];  then echo "User is root" && exit 1  ; else echo "User isn't root"; fi
+  tags:
+    - docker
+
+code_quality:
+  stage: security_compliance
+  image: docker:stable
+  allow_failure: false
+  services:
+    - name: docker:dind
+      entrypoint: ["env", "-u", "DOCKER_HOST"]
+      command: ["dockerd-entrypoint.sh"]
+  variables:
+    DOCKER_DRIVER: overlay2
+    DOCKER_TLS_CERTDIR: ""
+  script:
+    - docker run 
+       --env CODECLIMATE_DEBUG=1 
+       --env CODECLIMATE_CODE="$PWD" 
+       --volume "$PWD":/code 
+       --volume /var/run/docker.sock:/var/run/docker.sock 
+       --volume /tmp/cc:/tmp/cc 
+       codeclimate/codeclimate:0.85.25 analyze -f html | tee report.html
+  artifacts:
+    paths: [report.html]
+    expire_in: 1 weeks
+  tags:
+    - docker
+
+LicenseFinder :
+  stage: security_compliance
+  image: licensefinder/license_finder:6.15.0
+  allow_failure: false
+  before_script:
+    - rm /etc/apt/sources.list.d/erlang-solutions.list
+    - apt update
+    - apt-get install -y ruby ruby-full build-essential
+    - cd /LicenseFinder
+    - gem install license_finder
+    - gem install bundler:2.2.33
+    - bundle install
+    - cd -
+  script:
+    - pip3 install -r requirements.txt
+    - license_finder ${CI_PROJECT_NAME} add
+    - license_finder report --python-version=3 --format html | tee report.html
+  artifacts:
+    paths: [report.html]
+    expire_in: 1 weeks
+  tags:
+    - docker
+
+trivy:
+  stage: security_compliance
+  allow_failure: false
+  image: docker:stable
+  services:
+    - name: docker:dind
+      entrypoint: ["env", "-u", "DOCKER_HOST"]
+      command: ["dockerd-entrypoint.sh"]
+  variables:
+    DOCKER_HOST: tcp://docker:2375/
+    DOCKER_DRIVER: overlay2
+    # See https://github.com/docker-library/docker/pull/166
+    DOCKER_TLS_CERTDIR: ""
+    IMAGE: trivy-ci-test:$CI_COMMIT_SHA
+    TRIVY_VERSION: "0.20.1"
+  before_script:
+    - var=$(echo ${CVE_WHITELIST} | tr " " "\n")
+    - for i in ${var}; do count=$(($count+1)) echo $i >> .trivyignore; done
+    - if [ -f .trivyignore ]; then cat .trivyignore; fi
+    - wget --no-verbose https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz -O - | tar -zxvf -
+  script:
+    # Build image
+    - docker build -t $IMAGE .
+    # Build report
+    - ./trivy --exit-code 0 --cache-dir .trivycache/ --no-progress --format template --template "@contrib/gitlab.tpl" -o gl-container-scanning-report.json $IMAGE
+    # Print report
+    - ./trivy --exit-code 0 --cache-dir .trivycache/ --no-progress --severity HIGH $IMAGE
+    # Fail on severe vulnerabilities
+    - ./trivy --exit-code 1 --cache-dir .trivycache/ --severity CRITICAL --no-progress $IMAGE
+  cache:
+    paths:
+      - .trivycache/
+  # Enables https://docs.gitlab.com/ee/user/application_security/container_scanning/ (Container Scanning report is available on GitLab EE Ultimate or GitLab.com Gold)
+  artifacts:
+    reports:
+      container_scanning: gl-container-scanning-report.json
+  tags:
+    - docker
+
+.kaniko-ecr-config: &kaniko-ecr-config |
+  echo "{\"auths\":{\"${DOCKER_REGISTRY_PUSH_SERVER}\":{\"username\":\"$DOCKER_REGISTRY_PUSH_USER\",\"password\":\"$DOCKER_REGISTRY_PUSH_PASSWORD\"}}}" > /kaniko/.docker/config.json
+
+.kaniko-command: &kaniko-command |
+  echo "Building: ${DOCKER_REGISTRY_PUSH_SERVER}/${CI_PROJECT_ROOT_NAMESPACE}/${CI_PROJECT_NAME}:${CI_COMMIT_REF_SLUG}-${CI_COMMIT_SHORT_SHA}"
+  /kaniko/executor \
+    --verbosity=error \
+    --context=${CI_PROJECT_DIR} \
+    --dockerfile=${CI_PROJECT_DIR}/Dockerfile \
+    --destination="${DOCKER_REGISTRY_PUSH_SERVER}/${CI_PROJECT_ROOT_NAMESPACE}/${CI_PROJECT_NAME}:${CI_COMMIT_REF_SLUG}-${CI_COMMIT_SHORT_SHA}"
+
+Release_QA:
+  image:
+    name: gcr.io/kaniko-project/executor:debug
+    entrypoint: [ "" ]
+  stage: Release_QA
+  variables:
+    GIT_SUBMODULE_STRATEGY: recursive
+    GIT_STRATEGY: clone
+  script:
+    - *kaniko-ecr-config
+    - *kaniko-command
+  only:
+    refs:
+      - develop
+      - main
+  tags:
+    - docker
+
+.cat-version: &cat-version |
+  MAJOR_VERSION=`cat VERSION`
+
+.crane-login: &crane-login |
+  crane auth login -u $DOCKER_REGISTRY_PUSH_USER -p $DOCKER_REGISTRY_PUSH_PASSWORD $DOCKER_REGISTRY_PUSH_SERVER
+
+.crane-retag-image: &crane-retag-image |
+  echo "Retagging: ${CI_COMMIT_REF_SLUG}-${CI_COMMIT_SHORT_SHA} to ${ENV}-${MAJOR_VERSION}-${CI_COMMIT_SHORT_SHA}"
+  crane cp "${DOCKER_REGISTRY_PUSH_SERVER}/${CI_PROJECT_ROOT_NAMESPACE}/${CI_PROJECT_NAME}:${CI_COMMIT_REF_SLUG}-${CI_COMMIT_SHORT_SHA}" "${DOCKER_REGISTRY_PUSH_SERVER}/${CI_PROJECT_ROOT_NAMESPACE}/${CI_PROJECT_NAME}:${ENV}-${MAJOR_VERSION}-${CI_COMMIT_SHORT_SHA}"
+
+.crane-template:
+  when: manual
+  needs: ["Release_QA"]
+  image:
+    name: gcr.io/go-containerregistry/crane:debug
+    entrypoint: [""]
+  before_script:
+    - *crane-login
+  script:
+    - *cat-version
+    - *crane-retag-image
+
+Release_PreProduction:
+  stage: Release_PreProduction      
+  extends: .crane-template
+  variables:
+    ENV: "preproduction"
+  only:
+    - main
+  tags:
+    - docker
+
+Release_Production:
+  stage: Release_Production
+  extends: .crane-template
+  variables:
+    ENV: "production"
+  only:
+    - main
+  tags:
+    - docker

@@ -1,0 +1,32 @@
+stages:
+  - merge-check
+  - validate
+
+allowed-merge:
+  stage: merge-check
+  script:
+    - echo "Merge request needs to be done from (develop) to main"
+    - >
+      if [[ $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == develop ]]; then
+        exit 0
+      else
+        if [[ $CI_MERGE_REQUEST_SOURCE_BRANCH_NAME == develop ]]; then
+            echo "Valid branch $CI_MERGE_REQUEST_SOURCE_BRANCH_NAME"
+            exit 0;
+            else
+                echo "Not valid branch $CI_MERGE_REQUEST_SOURCE_BRANCH_NAME"
+                exit 1; 
+          fi
+      fi
+  only:
+   - merge_requests
+  tags:
+    - docker
+
+validate:
+  image: dwdraju/alpine-curl-jq:latest
+  stage: validate
+  script:
+    - ./tests/validate.sh
+  tags:
+    - dublin
