@@ -1,0 +1,64 @@
+variables:
+ DOCKER_DRIVER: overlay
+ GIT_SUBMODULE_STRATEGY: recursive
+
+# Caching of /root/.sbt and /root/.ivy2 is done at host level
+# See configuration of the GitLab Kubernetes Runner
+
+# Future refactoring: https://docs.gitlab.com/ce/ci/yaml/#special-yaml-features
+
+# The indentation and spacing for the multiline string below is important!
+
+image: hseeberger/scala-sbt:11.0.10_1.5.0_2.13.5
+
+stages:
+  - build
+  - integration
+  - release
+
+buildAndTest:
+  stage: build
+  except:
+    - tags
+  script:
+    - echo "### Building ${CI_PROJECT_PATH}:${CI_COMMIT_REF_SLUG}-${CI_COMMIT_SHORT_SHA}"
+    - sbt -mem 1500 -Dsbt.ci=true clean compile coverage test coverageReport
+  artifacts:
+    reports:
+      cobertura: target/scala-2.12/coverage-report/cobertura.xml
+  tags:
+    - docker
+
+integration-tests:
+  stage: integration
+  allow_failure: false
+  when: manual
+  dependencies:
+    - buildAndTest
+  except:
+    - tags
+  script:
+    - sbt -mem 1500 -Dsbt.log.noformat=true it:test
+  tags:
+    - docker
+
+release:
+  stage: release
+  allow_failure: false
+  when: manual
+  only:
+    - main
+  before_script:
+    - mkdir -p /root/.ssh
+    - echo ${GIT_AUTOMATION_AUTH} | base64 -d > /root/.ssh/id_rsa && chmod 700 /root/.ssh/id_rsa
+    - echo ${GIT_AUTOMATION_KNOW_HOSTS} | base64 -d > /root/.ssh/known_hosts
+    - git remote set-url --push origin "git@${CI_SERVER_HOST}:${CI_PROJECT_PATH}.git"
+    - git config user.email "automation-user@test.com"
+    - git config --global user.name "Automation User"
+    - git checkout main && git reset --hard origin/main && git pull
+    - git status
+    - echo Release will run for commit $(git rev-parse HEAD)
+  script:
+    - sbt -mem 1500 -Dsbt.ci=true "release with-defaults"
+  tags:
+    - docker
